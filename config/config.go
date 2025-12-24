@@ -18,6 +18,8 @@ var (
 )
 
 type Global struct {
+	HttpPort          int    `mapstructure:"http_port" default:"8080"`
+	HttpListen        string `mapstructure:"http_listen" default:"0.0.0.0"`
 	TproxyPort        uint16 `mapstructure:"tproxy_port" default:"12345"`
 	TproxyPortProtect bool   `mapstructure:"tproxy_port_protect" default:"true"`
 	SoMarkFromDae     uint32 `mapstructure:"so_mark_from_dae"`

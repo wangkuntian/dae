@@ -143,15 +143,44 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 		// Do not marshal zero value.
 		return nil
 	}
+	// Handle interface types (like FunctionListOrString, FunctionOrString)
+	if from.Kind() == reflect.Interface && !from.IsNil() {
+		// Get the actual value from the interface
+		actualValue := from.Elem()
+		// Recursively call marshalLeaf with the actual value
+		return m.marshalLeaf(key, actualValue, depth)
+	}
 	switch from.Kind() {
 	case reflect.Slice:
 		if from.Len() == 0 {
 			return nil
 		}
+		firstElem := from.Index(0)
+		// Check if it's a nested slice (2D array)
+		if firstElem.Kind() == reflect.Slice {
+			// Handle 2D arrays like [][]*config_parser.Function
+			if firstElem.Len() > 0 {
+				switch firstElem.Index(0).Interface().(type) {
+				case *config_parser.Function:
+					// Handle [][]*config_parser.Function (repeatable filter)
+					for i := 0; i < from.Len(); i++ {
+						innerSlice := from.Index(i)
+						var vals []string
+						for j := 0; j < innerSlice.Len(); j++ {
+							v := innerSlice.Index(j).Interface().(*config_parser.Function)
+							vals = append(vals, v.String(true, true, false))
+						}
+						m.writeLine(depth, key+":"+strings.Join(vals, " && "))
+					}
+					return nil
+				}
+			}
+		}
+		// Handle 1D arrays
 		switch from.Index(0).Interface().(type) {
 		case fmt.Stringer, string,
 			uint8, uint16, uint32, uint64,
-			int8, int16, int32, int64,
+			int, int8, int16, int32, int64,
 			float32, float64,
 			bool:
 			var vals []string
@@ -179,7 +208,7 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 		switch val := from.Interface().(type) {
 		case fmt.Stringer, string,
 			uint8, uint16, uint32, uint64,
-			int8, int16, int32, int64,
+			int, int8, int16, int32, int64,
 			float32, float64,
 			bool:
 			m.writeLine(depth, key+":"+strconv.Quote(fmt.Sprintf("%v", val)))
@@ -210,6 +239,7 @@ func (m *Marshaller) marshalParam(from reflect.Value, depth int) (err error) {
 		if key == "_" {
 			switch structField.Name {
 			case "Name":
+				// Name is used for section identification, skip marshaling
 			case "Rules":
 				// Expand.
 				rules, ok := field.Interface().([]*config_parser.RoutingRule)
@@ -220,7 +250,12 @@ func (m *Marshaller) marshalParam(from reflect.Value, depth int) (err error) {
 					m.writeLine(depth, r.String(false, true, true))
 				}
 			default:
-				return fmt.Errorf("unknown reserved field: %v", structField.Name)
+				// Annotation fields (like FilterAnnotation) are metadata and should not be marshaled
+				if strings.HasSuffix(structField.Name, "Annotation") {
+					// Skip annotation fields
+				} else {
+					return fmt.Errorf("unknown reserved field: %v", structField.Name)
+				}
 			}
 			continue
 		}

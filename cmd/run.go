@@ -54,6 +54,7 @@ var (
 		"http://www.gstatic.com/generate_204",
 		"http://www.qualcomm.cn/generate_204",
 	}
+	conf *config.Config
 )
 
 func init() {
@@ -94,7 +95,11 @@ var (
 			}
 
 			// Read config from --config cfgFile.
-			conf, includes, err := readConfig(cfgFile)
+			var (
+				includes []string
+				err      error
+			)
+			conf, includes, err = readConfig(cfgFile)
 			if err != nil {
 				logrus.WithFields(logrus.Fields{
 					"err": err,
@@ -139,6 +144,11 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 		pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
 		pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
 		go pprofServer.ListenAndServe()
+	}
+
+	// Start HTTP server if configured.
+	if conf.Global.HttpPort != 0 {
+		go startServer(log, conf)
 	}
 
 	// Serve tproxy TCP/UDP server util signals.
@@ -263,7 +273,7 @@ loop:
 			if err := c.StopDNSListener(); err != nil {
 				log.Warnf("[Reload] Failed to stop old DNS listener: %v", err)
 			}
-			
+
 			log.Warnln("[Reload] Load new control plane")
 			newC, err := newControlPlane(log, obj, dnsCache, newConf, externGeoDataDirs)
 			if err != nil {
@@ -311,6 +321,11 @@ loop:
 				pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
 				go pprofServer.ListenAndServe()
 			}
+
+			if newConf.Global.HttpPort != 0 {
+				go startServer(log, newConf)
+			}
+
 		case syscall.SIGHUP:
 			// Ignore.
 			continue
@@ -321,6 +336,10 @@ loop:
 	}
 	defer os.Remove(PidFilePath)
 	defer control.GetDaeNetns().Close()
+	if httpServer != nil {
+		httpServer.server.Shutdown(context.Background())
+		httpServer = nil
+	}
 	if e := c.Close(); e != nil {
 		return fmt.Errorf("close control plane: %w", e)
 	}
