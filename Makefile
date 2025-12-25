@@ -116,3 +116,10 @@ ebpf-test: submodule clean-ebpf
     go test -v ./control/kern/tests/...
 
 ## End Ebpf
+
+
+build-linux-arm64:
+	GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dae-linux-arm64 ./main.go
+
+build-darwin-arm64:
+	GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dae-darwin-arm64 ./main.go

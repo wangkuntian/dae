@@ -127,9 +127,24 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 	}, nil
 }
 
-func (c *DnsController) cacheKey(qname string, qtype uint16) string {
+func (c *DnsController) cacheKey(qname string, qtype uint16, src netip.AddrPort) string {
 	// To fqdn.
-	return dnsmessage.CanonicalName(qname) + strconv.Itoa(int(qtype))
+	// Include src in cache key to differentiate DNS results from different proxy groups.
+	srcStr := src.Addr().String()
+	if !src.Addr().IsValid() {
+		// Use empty string for invalid src (e.g., system-level cache)
+		srcStr = "0.0.0.0"
+	}
+	key := dnsmessage.CanonicalName(qname) + strconv.Itoa(int(qtype)) + "|" + srcStr
+	if c.log.IsLevelEnabled(logrus.DebugLevel) {
+		c.log.WithFields(logrus.Fields{
+			"qname": qname,
+			"qtype": QtypeToString(qtype),
+			"src":   srcStr,
+			"key":   key,
+		}).Debugf("Generated DNS cache key")
+	}
+	return key
 }
 
 func (c *DnsController) RemoveDnsRespCache(cacheKey string) {
@@ -145,6 +160,11 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 	cache, ok := c.dnsCache[cacheKey]
 	c.dnsCacheMu.Unlock()
 	if !ok {
+		if c.log.IsLevelEnabled(logrus.DebugLevel) {
+			c.log.WithFields(logrus.Fields{
+				"cacheKey": cacheKey,
+			}).Debugf("DNS cache miss")
+		}
 		return nil
 	}
 	var deadline time.Time
@@ -156,12 +176,22 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 	// We should make sure the cache did not expire, or
 	// return nil and request a new lookup to refresh the cache.
 	if !deadline.After(time.Now()) {
+		if c.log.IsLevelEnabled(logrus.DebugLevel) {
+			c.log.WithFields(logrus.Fields{
+				"cacheKey": cacheKey,
+				"deadline": deadline,
+			}).Debugf("DNS cache expired")
+		}
 		return nil
 	}
 	if err := c.cacheAccessCallback(cache); err != nil {
 		c.log.Warnf("failed to BatchUpdateDomainRouting: %v", err)
 		return nil
 	}
+	c.log.WithFields(logrus.Fields{
+		"cacheKey": cacheKey,
+		"deadline": deadline,
+	}).Infof("DNS cache hit")
 	return cache
 }
 
@@ -182,7 +212,7 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 }
 
 // NormalizeAndCacheDnsResp_ handle DNS resp in place.
-func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg) (err error) {
+func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, src netip.AddrPort) (err error) {
 	// Check healthy resp.
 	if !msg.Response || len(msg.Question) == 0 {
 		return nil
@@ -213,7 +243,7 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg) (err erro
 	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
 	default:
 		// Update DnsCache.
-		if err = c.updateDnsCache(msg, ttl, &q); err != nil {
+		if err = c.updateDnsCache(msg, ttl, &q, src); err != nil {
 			return err
 		}
 		return nil
@@ -238,31 +268,32 @@ loop:
 	}
 	if !reqIpRecord {
 		// Update DnsCache.
-		if err = c.updateDnsCache(msg, ttl, &q); err != nil {
+		if err = c.updateDnsCache(msg, ttl, &q, src); err != nil {
 			return err
 		}
 		return nil
 	}
 
 	// Update DnsCache.
-	if err = c.updateDnsCache(msg, ttl, &q); err != nil {
+	if err = c.updateDnsCache(msg, ttl, &q, src); err != nil {
 		return err
 	}
 	// Pack to get newData.
 	return nil
 }
 
-func (c *DnsController) updateDnsCache(msg *dnsmessage.Msg, ttl uint32, q *dnsmessage.Question) error {
+func (c *DnsController) updateDnsCache(msg *dnsmessage.Msg, ttl uint32, q *dnsmessage.Question, src netip.AddrPort) error {
 	// Update DnsCache.
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		c.log.WithFields(logrus.Fields{
 			"_qname": q.Name,
 			"rcode":  msg.Rcode,
 			"ans":    FormatDnsRsc(msg.Answer),
+			"src":    src.String(),
 		}).Tracef("Update DNS record cache")
 	}
 
-	if err := c.UpdateDnsCacheTtl(q.Name, q.Qtype, msg.Answer, int(ttl)); err != nil {
+	if err := c.UpdateDnsCacheTtl(q.Name, q.Qtype, msg.Answer, int(ttl), src); err != nil {
 		return err
 	}
 	return nil
@@ -270,7 +301,7 @@ func (c *DnsController) updateDnsCache(msg *dnsmessage.Msg, ttl uint32, q *dnsme
 
 type daedlineFunc func(now time.Time, host string) (deadline time.Time, originalDeadline time.Time)
 
-func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, answers []dnsmessage.RR, deadlineFunc daedlineFunc) (err error) {
+func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, answers []dnsmessage.RR, src netip.AddrPort, deadlineFunc daedlineFunc) (err error) {
 	var fqdn string
 	if strings.HasSuffix(host, ".") {
 		fqdn = strings.ToLower(host)
@@ -286,15 +317,33 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 	now := time.Now()
 	deadline, originalDeadline := deadlineFunc(now, host)
 
-	cacheKey := c.cacheKey(fqdn, dnsTyp)
+	cacheKey := c.cacheKey(fqdn, dnsTyp, src)
 	c.dnsCacheMu.Lock()
 	cache, ok := c.dnsCache[cacheKey]
 	if ok {
+		if c.log.IsLevelEnabled(logrus.DebugLevel) {
+			c.log.WithFields(logrus.Fields{
+				"cacheKey": cacheKey,
+				"host":     host,
+				"dnsTyp":   dnsTyp,
+				"src":      src.Addr().String(),
+				"action":   "update",
+			}).Debugf("Updating existing DNS cache entry")
+		}
 		cache.Answer = answers
 		cache.Deadline = deadline
 		cache.OriginalDeadline = originalDeadline
 		c.dnsCacheMu.Unlock()
 	} else {
+		if c.log.IsLevelEnabled(logrus.DebugLevel) {
+			c.log.WithFields(logrus.Fields{
+				"cacheKey": cacheKey,
+				"host":     host,
+				"dnsTyp":   dnsTyp,
+				"src":      src.Addr().String(),
+				"action":   "create",
+			}).Debugf("Creating new DNS cache entry")
+		}
 		cache, err = c.newCache(fqdn, answers, deadline, originalDeadline)
 		if err != nil {
 			c.dnsCacheMu.Unlock()
@@ -310,8 +359,8 @@ func (c *DnsController) __updateDnsCacheDeadline(host string, dnsTyp uint16, ans
 	return nil
 }
 
-func (c *DnsController) UpdateDnsCacheDeadline(host string, dnsTyp uint16, answers []dnsmessage.RR, deadline time.Time) (err error) {
-	return c.__updateDnsCacheDeadline(host, dnsTyp, answers, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
+func (c *DnsController) UpdateDnsCacheDeadline(host string, dnsTyp uint16, answers []dnsmessage.RR, deadline time.Time, src netip.AddrPort) (err error) {
+	return c.__updateDnsCacheDeadline(host, dnsTyp, answers, src, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
 		if fixedTtl, ok := c.fixedDomainTtl[host]; ok {
 			/// NOTICE: Cannot set TTL accurately.
 			if now.Sub(deadline).Seconds() > float64(fixedTtl) {
@@ -323,8 +372,8 @@ func (c *DnsController) UpdateDnsCacheDeadline(host string, dnsTyp uint16, answe
 	})
 }
 
-func (c *DnsController) UpdateDnsCacheTtl(host string, dnsTyp uint16, answers []dnsmessage.RR, ttl int) (err error) {
-	return c.__updateDnsCacheDeadline(host, dnsTyp, answers, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
+func (c *DnsController) UpdateDnsCacheTtl(host string, dnsTyp uint16, answers []dnsmessage.RR, ttl int, src netip.AddrPort) (err error) {
+	return c.__updateDnsCacheDeadline(host, dnsTyp, answers, src, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
 		originalDeadline = now.Add(time.Duration(ttl) * time.Second)
 		if fixedTtl, ok := c.fixedDomainTtl[host]; ok {
 			return now.Add(time.Duration(fixedTtl) * time.Second), originalDeadline
@@ -417,7 +466,7 @@ func (c *DnsController) HandleWithResponseWriter_(dnsMessage *dnsmessage.Msg, re
 	}
 
 	// Join results and consider whether to response.
-	resp := c.LookupDnsRespCache_(dnsMessage, c.cacheKey(qname, qtype), true)
+	resp := c.LookupDnsRespCache_(dnsMessage, c.cacheKey(qname, qtype, req.src), true)
 	if resp == nil {
 		// resp is not valid.
 		c.log.WithFields(logrus.Fields{
@@ -426,7 +475,7 @@ func (c *DnsController) HandleWithResponseWriter_(dnsMessage *dnsmessage.Msg, re
 		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
 	}
 	// resp is valid.
-	cache2 := c.LookupDnsRespCache(c.cacheKey(qname, qtype2), true)
+	cache2 := c.LookupDnsRespCache(c.cacheKey(qname, qtype2, req.src), true)
 	if c.qtypePrefer == qtype || cache2 == nil || !cache2.IncludeAnyIp() {
 		if responseWriter != nil {
 			var respMsg dnsmessage.Msg
@@ -470,7 +519,16 @@ func (c *DnsController) handleWithResponseWriter_(
 		return err
 	}
 
-	cacheKey := c.cacheKey(qname, qtype)
+	cacheKey := c.cacheKey(qname, qtype, req.src)
+	if c.log.IsLevelEnabled(logrus.DebugLevel) {
+		c.log.WithFields(logrus.Fields{
+			"qname":    qname,
+			"qtype":    QtypeToString(qtype),
+			"src":      req.src.String(),
+			"realSrc":  req.realSrc.String(),
+			"cacheKey": cacheKey,
+		}).Debugf("DNS request - looking up cache")
+	}
 
 	if upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
 		// Reject with empty answer.
@@ -507,13 +565,33 @@ func (c *DnsController) handleWithResponseWriter_(
 		}
 		if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
 			q := dnsMessage.Question[0]
-			c.log.Debugf("UDP(DNS) %v <-> Cache: %v %v",
+			c.log.WithFields(logrus.Fields{
+				"cacheKey": cacheKey,
+				"qname":    strings.ToLower(q.Name),
+				"qtype":    QtypeToString(q.Qtype),
+				"src":      req.src.String(),
+				"realSrc":  req.realSrc.String(),
+			}).Debugf("UDP(DNS) %v <-> Cache: %v %v",
 				RefineSourceToShow(req.realSrc, req.realDst.Addr()), strings.ToLower(q.Name), QtypeToString(q.Qtype),
 			)
 		}
 		return nil
 	}
 
+	if c.log.IsLevelEnabled(logrus.DebugLevel) {
+		upstreamName := upstreamIndex.String()
+		if upstream != nil {
+			upstreamName = upstream.String()
+		}
+		c.log.WithFields(logrus.Fields{
+			"cacheKey": cacheKey,
+			"qname":    qname,
+			"qtype":    QtypeToString(qtype),
+			"src":      req.src.String(),
+			"realSrc":  req.realSrc.String(),
+			"upstream": upstreamName,
+		}).Debugf("DNS cache miss - requesting from upstream")
+	}
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		upstreamName := upstreamIndex.String()
 		if upstream != nil {
@@ -727,7 +805,7 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 			return fmt.Errorf("unknown upstream: %v", upstreamIndex.String())
 		}
 	}
-	if err = c.NormalizeAndCacheDnsResp_(respMsg); err != nil {
+	if err = c.NormalizeAndCacheDnsResp_(respMsg, req.src); err != nil {
 		return err
 	}
 	if needResp {

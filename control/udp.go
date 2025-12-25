@@ -181,7 +181,7 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 		shouldReroute bool
 		dialIp        bool
 	)
-	_, shouldReroute, _ = c.ChooseDialTarget(outboundIndex, realDst, domain)
+	_, shouldReroute, _ = c.ChooseDialTarget(outboundIndex, realDst, domain, realSrc)
 	// Do not overwrite target.
 	// This fixes a problem that quic connection to google servers.
 	// Reproduce:

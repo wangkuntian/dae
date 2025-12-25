@@ -499,7 +499,7 @@ func NewControlPlane(
 				// Unexpected.
 				return nil, err
 			}
-			_ = plane.dnsController.UpdateDnsCacheDeadline(host, uint16(typ), cache.Answer, cache.Deadline)
+			_ = plane.dnsController.UpdateDnsCacheDeadline(host, uint16(typ), cache.Answer, cache.Deadline, netip.AddrPort{})
 		}
 	} else if _bpf != nil {
 		// Is reloading, and dnsCache == nil.
@@ -618,7 +618,7 @@ func (c *ControlPlane) dnsUpstreamReadyCallback(dnsUpstream *dns.Upstream) (err 
 			},
 			A: dnsUpstream.Ip4.AsSlice(),
 		}}
-		if err = c.dnsController.UpdateDnsCacheDeadline(dnsUpstream.Hostname, typ, answers, deadline); err != nil {
+		if err = c.dnsController.UpdateDnsCacheDeadline(dnsUpstream.Hostname, typ, answers, deadline, netip.AddrPort{}); err != nil {
 			return err
 		}
 	}
@@ -634,7 +634,7 @@ func (c *ControlPlane) dnsUpstreamReadyCallback(dnsUpstream *dns.Upstream) (err 
 			},
 			AAAA: dnsUpstream.Ip6.AsSlice(),
 		}}
-		if err = c.dnsController.UpdateDnsCacheDeadline(dnsUpstream.Hostname, typ, answers, deadline); err != nil {
+		if err = c.dnsController.UpdateDnsCacheDeadline(dnsUpstream.Hostname, typ, answers, deadline, netip.AddrPort{}); err != nil {
 			return err
 		}
 	}
@@ -650,13 +650,22 @@ func (c *ControlPlane) ActivateCheck() {
 	}
 }
 
-func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip.AddrPort, domain string) (dialTarget string, shouldReroute bool, dialIp bool) {
+func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip.AddrPort, domain string, src netip.AddrPort) (dialTarget string, shouldReroute bool, dialIp bool) {
 	dialMode := consts.DialMode_Ip
 
 	if !outbound.IsReserved() && domain != "" {
 		switch c.dialMode {
 		case consts.DialMode_Domain:
-			if cache := c.dnsController.LookupDnsRespCache(c.dnsController.cacheKey(domain, common.AddrToDnsType(dst.Addr())), true); cache != nil {
+			// Use src to lookup cache, so we can find the correct cache for the proxy group
+			systemCacheKey := c.dnsController.cacheKey(domain, common.AddrToDnsType(dst.Addr()), src)
+			if c.log.IsLevelEnabled(logrus.DebugLevel) {
+				c.log.WithFields(logrus.Fields{
+					"domain":   domain,
+					"cacheKey": systemCacheKey,
+					"src":      src.Addr().String(),
+				}).Debugf("DNS cache lookup with")
+			}
+			if cache := c.dnsController.LookupDnsRespCache(systemCacheKey, true); cache != nil {
 				// Has A/AAAA records. It is a real domain.
 				dialMode = consts.DialMode_Domain
 			} else {

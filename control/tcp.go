@@ -103,7 +103,7 @@ func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err 
 	src := p.Src
 	dst := p.Dest
 
-	dialTarget, shouldReroute, dialIp := c.ChooseDialTarget(outboundIndex, dst, domain)
+	dialTarget, shouldReroute, dialIp := c.ChooseDialTarget(outboundIndex, dst, domain, src)
 	if shouldReroute {
 		outboundIndex = consts.OutboundControlPlaneRouting
 	}
@@ -123,7 +123,7 @@ func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err 
 			)
 		}
 		// Reset dialTarget.
-		dialTarget, _, dialIp = c.ChooseDialTarget(outboundIndex, dst, domain)
+		dialTarget, _, dialIp = c.ChooseDialTarget(outboundIndex, dst, domain, src)
 	default:
 	}
 	if routingResult.Mark == 0 {
